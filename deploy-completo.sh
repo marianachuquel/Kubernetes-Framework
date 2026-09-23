@@ -190,7 +190,14 @@ EOF
 echo -e "\n${BLUE}=== [1/4] Provisionando Máquinas Virtuais no Multipass ===${NC}"
 for vm in "${VMS[@]}"; do
     if multipass info "$vm" &> /dev/null; then
-        echo -e "${YELLOW}[AVISO] A VM '$vm' já existe. Pulando criação.${NC}"
+        echo -e "${YELLOW}[AVISO] A VM '$vm' já existe.${NC}"
+        STATE=$(multipass info "$vm" | awk '/State:/ {print $2}')
+        if [[ "$STATE" != "Running" ]]; then
+            echo -e "${BLUE}>>> VM '$vm' está parada ($STATE). Iniciando...${NC}"
+            multipass start "$vm"
+        else
+            echo -e "${GREEN}[OK] VM '$vm' já está em execução.${NC}"
+        fi
     else
         echo -e "${GREEN}>>> Lançando VM '$vm' ($VM_CPUS CPUs, $VM_MEMORY RAM, $VM_DISK Disco)...${NC}"
         multipass launch "$UBUNTU_RELEASE" \
