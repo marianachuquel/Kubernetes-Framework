@@ -119,14 +119,13 @@ if ! multipass list &> /dev/null; then
 fi
 echo -e "${GREEN}[OK] Multipass instalado e operante.${NC}"
 
-# Diretório temporário para gerar cloud-init e manifestos (apagado ao encerrar)
-TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
+# Arquivo temporário no HOME do usuário para permitir acesso pelo Snap do Multipass
+CLOUD_INIT_FILE="$HOME/.multipass-cloud-init.yaml"
+trap 'rm -f "$CLOUD_INIT_FILE"' EXIT
 
 # ------------------------------------------------------------------------------
 # 4. Geração Embutida do Cloud-Init
 # ------------------------------------------------------------------------------
-CLOUD_INIT_FILE="$TMP_DIR/cloud-init.yaml"
 cat << 'EOF' > "$CLOUD_INIT_FILE"
 #cloud-config
 
@@ -183,6 +182,7 @@ runcmd:
   # Ativar serviço iSCSI para o Longhorn
   - systemctl enable --now iscsid
 EOF
+chmod 644 "$CLOUD_INIT_FILE"
 
 # ------------------------------------------------------------------------------
 # 5. [Fase 0] Criação das Máquinas Virtuais no Multipass
