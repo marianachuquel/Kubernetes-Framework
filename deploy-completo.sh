@@ -381,11 +381,14 @@ multipass exec "$MASTER_NAME" -- kubectl delete pod "$ORIGINAL_POD" --force --gr
 # Aguardar subida do novo Pod no outro worker
 echo -e "${BLUE}>>> Aguardando novo Pod ser instanciado no worker sobrevivente...${NC}"
 NEW_POD=""
-for i in {1..45}; do
+for i in {1..90}; do
     POD_CANDIDATE=$(multipass exec "$MASTER_NAME" -- kubectl get pod -l app=app-persistente --field-selector status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
     if [[ -n "$POD_CANDIDATE" && "$POD_CANDIDATE" != "$ORIGINAL_POD" ]]; then
         NEW_POD="$POD_CANDIDATE"
         break
+    fi
+    if (( i % 5 == 0 )); then
+        echo -e "Aguardando transferência do volume e Pod ficar 'Running'... (${i}/90)"
     fi
     sleep 3
 done
