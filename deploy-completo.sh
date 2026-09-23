@@ -119,73 +119,62 @@ if ! multipass list &> /dev/null; then
 fi
 echo -e "${GREEN}[OK] Multipass instalado e operante.${NC}"
 
-# Arquivo temporário no HOME do usuário para permitir acesso pelo Snap do Multipass
-CLOUD_INIT_FILE="$HOME/.multipass-cloud-init.yaml"
-trap 'rm -f "$CLOUD_INIT_FILE"' EXIT
-
 # ------------------------------------------------------------------------------
-# 4. Geração Embutida do Cloud-Init
+# 4. Função para Configuração dos Nós (Swap, Kernel, Containerd, K8s, iSCSI)
 # ------------------------------------------------------------------------------
-cat << 'EOF' > "$CLOUD_INIT_FILE"
-#cloud-config
+configure_node() {
+    local vm="$1"
+    echo -e "${BLUE}>>> Configurando nó '$vm' (swapoff, containerd, kubeadm v1.29, iscsi)...${NC}"
+    multipass exec "$vm" -- sudo bash -s << 'EOF'
+set -euo pipefail
 
-write_files:
-  - path: /etc/modules-load.d/k8s.conf
-    owner: root:root
-    permissions: '0644'
-    content: |
-      overlay
-      br_netfilter
+# 1. Desativar Swap
+swapoff -a
+sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 
-  - path: /etc/sysctl.d/k8s.conf
-    owner: root:root
-    permissions: '0644'
-    content: |
-      net.bridge.bridge-nf-call-iptables  = 1
-      net.bridge.bridge-nf-call-ip6tables = 1
-      net.ipv4.ip_forward                 = 1
+# 2. Carregar módulos de Kernel
+cat << 'MODULES' > /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+MODULES
+modprobe overlay
+modprobe br_netfilter
 
-packages:
-  - apt-transport-https
-  - ca-certificates
-  - curl
-  - gpg
-  - containerd
-  - open-iscsi
-  - nfs-common
+# 3. Parametros sysctl de rede
+cat << 'SYSCTL' > /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+SYSCTL
+sysctl --system
 
-runcmd:
-  # Desativar swap
-  - swapoff -a
-  - sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+# 4. Instalar e configurar containerd com SystemdCgroup
+apt-get update
+apt-get install -y containerd
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+systemctl restart containerd
+systemctl enable containerd
 
-  # Carregar módulos e aplicar sysctl
-  - modprobe overlay
-  - modprobe br_netfilter
-  - sysctl --system
+# 5. Instalar kubeadm, kubelet e kubectl v1.29
+apt-get install -y apt-transport-https ca-certificates curl gpg
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
+apt-get update
+apt-get install -y kubelet kubeadm kubectl
+apt-mark hold kubelet kubeadm kubectl
 
-  # Configurar containerd
-  - mkdir -p /etc/containerd
-  - containerd config default > /etc/containerd/config.toml
-  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-  - systemctl restart containerd
-  - systemctl enable containerd
-
-  # Repositório Kubernetes v1.29 e instalação dos binários
-  - mkdir -p /etc/apt/keyrings
-  - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-  - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
-  - apt-get update
-  - apt-get install -y kubelet kubeadm kubectl
-  - apt-mark hold kubelet kubeadm kubectl
-
-  # Ativar serviço iSCSI para o Longhorn
-  - systemctl enable --now iscsid
+# 6. Dependencias do Longhorn
+apt-get install -y open-iscsi nfs-common
+systemctl enable --now iscsid
 EOF
-chmod 644 "$CLOUD_INIT_FILE"
+    echo -e "${GREEN}[OK] Nó '$vm' configurado com sucesso.${NC}"
+}
 
 # ------------------------------------------------------------------------------
-# 5. [Fase 0] Criação das Máquinas Virtuais no Multipass
+# 5. [Fase 0] Criação e Inicialização das Máquinas Virtuais no Multipass
 # ------------------------------------------------------------------------------
 echo -e "\n${BLUE}=== [1/4] Provisionando Máquinas Virtuais no Multipass ===${NC}"
 for vm in "${VMS[@]}"; do
@@ -204,16 +193,18 @@ for vm in "${VMS[@]}"; do
             --name "$vm" \
             --cpus "$VM_CPUS" \
             --memory "$VM_MEMORY" \
-            --disk "$VM_DISK" \
-            --cloud-init "$CLOUD_INIT_FILE"
+            --disk "$VM_DISK"
     fi
 done
 
-echo -e "${BLUE}>>> Aguardando a conclusão do Cloud-Init em todas as VMs...${NC}"
+# Configurar as dependências em cada nó
 for vm in "${VMS[@]}"; do
-    echo -e "Aguardando '$vm'..."
-    multipass exec "$vm" -- cloud-init status --wait
-    echo -e "${GREEN}[OK] '$vm' provisionada.${NC}"
+    IS_CONFIGURED=$(multipass exec "$vm" -- bash -c "command -v kubeadm &>/dev/null && echo 'yes' || echo 'no'")
+    if [[ "$IS_CONFIGURED" == "yes" ]]; then
+        echo -e "${GREEN}[OK] Nó '$vm' já possui as ferramentas do Kubernetes instaladas.${NC}"
+    else
+        configure_node "$vm"
+    fi
 done
 
 # ------------------------------------------------------------------------------
