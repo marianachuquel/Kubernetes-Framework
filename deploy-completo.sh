@@ -275,6 +275,9 @@ fi
 echo -e "${BLUE}>>> Aguardando componentes do Longhorn ficarem operacionais (rollout)...${NC}"
 multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status daemonset/longhorn-manager --timeout=400s
 multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status deployment/longhorn-driver-deployer --timeout=400s
+multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status daemonset/longhorn-csi-plugin --timeout=600s
+multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status deployment/csi-provisioner --timeout=600s
+multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status deployment/csi-attacher --timeout=600s
 
 echo -e "${BLUE}>>> Definindo StorageClass 'longhorn' como padrão...${NC}"
 multipass exec "$MASTER_NAME" -- kubectl patch storageclass longhorn \
@@ -332,18 +335,18 @@ echo -e "${BLUE}>>> Criando PVC de teste...${NC}"
 multipass exec "$MASTER_NAME" -- kubectl apply -f /tmp/pvc.yaml
 
 echo -e "${BLUE}>>> Aguardando PVC atingir status 'Bound'...${NC}"
-for i in {1..30}; do
+for i in {1..60}; do
     STATUS=$(multipass exec "$MASTER_NAME" -- kubectl get pvc longhorn-pvc-teste -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
     if [[ "$STATUS" == "Bound" ]]; then
         echo -e "${GREEN}[OK] PVC vinculado (Bound).${NC}"
         break
     fi
-    sleep 2
+    sleep 3
 done
 
 echo -e "${BLUE}>>> Fazendo deploy do NGINX persistente...${NC}"
 multipass exec "$MASTER_NAME" -- kubectl apply -f /tmp/app.yaml
-multipass exec "$MASTER_NAME" -- kubectl rollout status deployment/app-persistente --timeout=180s
+multipass exec "$MASTER_NAME" -- kubectl rollout status deployment/app-persistente --timeout=360s
 
 ORIGINAL_POD=$(multipass exec "$MASTER_NAME" -- kubectl get pod -l app=app-persistente --field-selector status.phase=Running -o jsonpath='{.items[0].metadata.name}')
 ACTIVE_WORKER=$(multipass exec "$MASTER_NAME" -- kubectl get pod "$ORIGINAL_POD" -o jsonpath='{.spec.nodeName}')
