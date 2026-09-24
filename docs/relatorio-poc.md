@@ -38,8 +38,8 @@ De acordo com os requisitos definidos e o ambiente criado via Multipass, a topol
   * Um Deployment simples do NGINX (`app-persistente`) foi executado, montando com sucesso o volume persistente provido pelo Longhorn.
   * Foram gerados e gravados dados dentro do volume persistente (arquivo `index.html` com a data atual).
 * **T.3.2: Testes de resiliência e simulação de falha de nós** - **[CONCLUÍDO]**
-  * **Cenário validado:** O nó trabalhador (`worker1`) que mantinha o Pod em execução foi intencionalmente desligado da rede (simulação de desastre/falha física).
-  * **Recuperação:** O Kubernetes reconheceu o nó inativo e planejou a subida do pod para o nó trabalhador sobrevivente. Após a liberação do lock de volume (`Multi-Attach error` - um mecanismo de segurança do Kubernetes/Longhorn superado de forma rápida e manual com a exclusão forçada do pod desatualizado), a aplicação ressurgiu íntegra no novo nó.
+  * **Cenário validado:** O nó trabalhador (`worker1`) que mantinha o Pod em execução foi intencionalmente desligado da rede (simulação de interrupção não programada do nó de computação).
+  * **Recuperação:** O Kubernetes reconheceu o nó inativo e planejou a subida do pod para o nó trabalhador sobrevivente. Após a liberação do lock de volume (`Multi-Attach error` - um mecanismo de segurança do Kubernetes/Longhorn superado com a exclusão do pod desatualizado), a aplicação restabeleceu a operação no novo nó.
   * **Prova de Persistência:** A leitura do arquivo dentro do novo Pod instanciado validou inequivocamente que os dados originais foram mantidos **100% intactos**, atestando o funcionamento da resiliência de dados do cluster.
 * **T.3.3: Estabelecimento de rotinas de monitoramento e backup do sistema de armazenamento** - **[CONCLUÍDO]**
   * O monitoramento da saúde e do uso de disco dos volumes foi validado de forma nativa através do próprio painel do Longhorn.

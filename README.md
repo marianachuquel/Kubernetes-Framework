@@ -74,7 +74,7 @@ A documentação do projeto está centralizada no diretório [`docs/`](docs/):
 3. **Fase 3 — Validação e Teste de Resiliência**:
    - Implantação de workload com montagem do volume persistente.
    - Escrita de dados de teste.
-   - Simulação de falha catastrófica desligando a VM trabalhadora.
+   - Injeção de falha com interrupção abrupta do nó de computação ativo.
    - Migração e comprovação de integridade dos dados no nó sobrevivente.
 
 ---
@@ -93,7 +93,7 @@ chmod +x deploy-completo.sh
 2. **Provisiona as 3 VMs** no Multipass (`master`, `worker1`, `worker2`) com kernel e dependências pré-configuradas.
 3. **Inicializa o Kubernetes v1.29**, configura o CNI Flannel e conecta os workers.
 4. **Instala o Helm e o Longhorn** com 2 réplicas e StorageClass padrão.
-5. **Executa o teste de resiliência**: cria um PVC/Pod NGINX, grava um token persistente, simula falha desligando um nó trabalhador, destrava o volume no nó sobrevivente e valida a preservação integral dos dados.
+5. **Executa o teste de resiliência**: cria um PVC/Pod NGINX, grava um identificador persistente, injeta falha desativando o nó de computação ativo, libera o lock de montagem CSI e valida a preservação integral dos dados no nó sobrevivente.
 
 ### Rodar apenas o Teste de Resiliência (em cluster já existente):
 Se você já tem as VMs e o Longhorn configurados e deseja apenas disparar o teste automatizado de failover:

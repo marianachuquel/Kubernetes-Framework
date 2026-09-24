@@ -263,7 +263,7 @@ kubectl get pod -l app=app-persistente -o wide
 ```
 *(Anote o nome do worker listado na coluna `NODE`).*
 
-**2. Simular falha grave do nó desligando a VM (Ex: worker1):**
+**2. Injetar falha de nó interrompendo a instância (Ex: worker1):**
 No terminal do **seu computador host**, execute:
 ```bash
 multipass stop worker1

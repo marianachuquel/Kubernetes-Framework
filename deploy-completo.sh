@@ -366,42 +366,42 @@ for i in {1..60}; do
     sleep 3
 done
 
-echo -e "${BLUE}>>> Fazendo deploy do NGINX persistente...${NC}"
+echo -e "${BLUE}>>> Implantando workload de teste (NGINX) com volume persistente...${NC}"
 multipass exec "$MASTER_NAME" -- kubectl apply -f /tmp/app.yaml
 multipass exec "$MASTER_NAME" -- kubectl rollout status deployment/app-persistente --timeout=360s
 
 ORIGINAL_POD=$(multipass exec "$MASTER_NAME" -- kubectl get pod -l app=app-persistente --field-selector status.phase=Running -o jsonpath='{.items[0].metadata.name}')
 ACTIVE_WORKER=$(multipass exec "$MASTER_NAME" -- kubectl get pod "$ORIGINAL_POD" -o jsonpath='{.spec.nodeName}')
-echo -e "${GREEN}>>> Pod '$ORIGINAL_POD' rodando no nó: ${YELLOW}$ACTIVE_WORKER${NC}"
+echo -e "${GREEN}[OK] Pod '$ORIGINAL_POD' operacional no nó: ${YELLOW}$ACTIVE_WORKER${NC}"
 
-# Gravação de dado exclusivo
+# Gravação de identificador no volume persistente
 TEST_TOKEN="POC_LONGHORN_PERSISTENCE_TOKEN_$(date +%s)_$RANDOM"
-echo -e "${BLUE}>>> Gravando token exclusivo no volume persistente: ${YELLOW}$TEST_TOKEN${NC}"
+echo -e "${BLUE}>>> Gravando identificador único no volume persistente: ${YELLOW}$TEST_TOKEN${NC}"
 multipass exec "$MASTER_NAME" -- kubectl exec "$ORIGINAL_POD" -- sh -c "echo '$TEST_TOKEN' > /usr/share/nginx/html/index.html"
 
 # Confirmar leitura inicial
 INITIAL_READ=$(multipass exec "$MASTER_NAME" -- kubectl exec "$ORIGINAL_POD" -- cat /usr/share/nginx/html/index.html | tr -d '\r\n')
 if [[ "$INITIAL_READ" != "$TEST_TOKEN" ]]; then
-    echo -e "${RED}[ERRO] Falha ao gravar dados iniciais no volume!${NC}"
+    echo -e "${RED}[ERRO] Falha na validação de escrita inicial no volume! Conteúdo lido: '$INITIAL_READ'${NC}"
     exit 1
 fi
-echo -e "${GREEN}[OK] Leitura inicial validada com sucesso.${NC}"
+echo -e "${GREEN}[OK] Persistência inicial validada com sucesso.${NC}"
 
-# Simulação de queda forçada do worker
-echo -e "\n${YELLOW}===============================================================${NC}"
-echo -e "${YELLOW}>>> SIMULANDO FALHA CATASTRÓFICA: Desligando nó '$ACTIVE_WORKER'...${NC}"
-echo -e "${YELLOW}===============================================================${NC}"
+# Injeção de falha: Interrupção não programada do nó ativo
+echo -e "\n${YELLOW}========================================================================${NC}"
+echo -e "${YELLOW}>>> Injetando falha: Interrupção não programada do nó '$ACTIVE_WORKER'...${NC}"
+echo -e "${YELLOW}========================================================================${NC}"
 multipass stop "$ACTIVE_WORKER"
 
-echo -e "${BLUE}>>> Nó '$ACTIVE_WORKER' desligado. Aguardando detecção pelo Kubernetes...${NC}"
+echo -e "${BLUE}>>> Nó '$ACTIVE_WORKER' desativado. Aguardando reconciliação do plano de controle...${NC}"
 sleep 15
 
-# Liberação da trava de segurança do Longhorn (Multi-Attach protection)
-echo -e "${BLUE}>>> Forçando exclusão do pod no nó morto para destravar o volume...${NC}"
+# Mitigação da proteção de Multi-Attach do Longhorn
+echo -e "${BLUE}>>> Removendo pod no nó inativo para liberação do lock de montagem (VolumeAttachment)...${NC}"
 multipass exec "$MASTER_NAME" -- kubectl delete pod "$ORIGINAL_POD" --force --grace-period=0 2>/dev/null || true
 
-# Aguardar subida do novo Pod no outro worker
-echo -e "${BLUE}>>> Aguardando novo Pod ser instanciado no worker sobrevivente...${NC}"
+# Aguardar realocação do Pod no nó restante
+echo -e "${BLUE}>>> Aguardando realocação do pod no nó operacional restante...${NC}"
 NEW_POD=""
 for i in {1..90}; do
     POD_CANDIDATE=$(multipass exec "$MASTER_NAME" -- kubectl get pod -l app=app-persistente --field-selector status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
@@ -410,42 +410,42 @@ for i in {1..90}; do
         break
     fi
     if (( i % 5 == 0 )); then
-        echo -e "Aguardando transferência do volume e Pod ficar 'Running'... (${i}/90)"
+        echo -e "Aguardando desanexação/anexação do volume CSI e inicialização do Pod... (${i}/90)"
     fi
     sleep 3
 done
 
 if [[ -z "$NEW_POD" ]]; then
-    echo -e "${RED}[ERRO] Timeout aguardando novo Pod no nó sobrevivente!${NC}"
+    echo -e "${RED}[ERRO] Tempo limite excedido durante a realocação do pod no nó sobrevivente.${NC}"
     multipass start "$ACTIVE_WORKER" || true
     exit 1
 fi
 
 SURVIVING_WORKER=$(multipass exec "$MASTER_NAME" -- kubectl get pod "$NEW_POD" -o jsonpath='{.spec.nodeName}')
-echo -e "${GREEN}[OK] Novo Pod '$NEW_POD' operacional no nó: ${YELLOW}$SURVIVING_WORKER${NC}"
+echo -e "${GREEN}[OK] Pod realocado com êxito ('$NEW_POD') no nó: ${YELLOW}$SURVIVING_WORKER${NC}"
 
-# Validação do conteúdo
-echo -e "${BLUE}>>> Verificando integridade dos dados pós-queda...${NC}"
+# Validação da integridade dos dados pós-failover
+echo -e "${BLUE}>>> Validando integridade dos dados persistidos no pod realocado...${NC}"
 RECOVERED_DATA=$(multipass exec "$MASTER_NAME" -- kubectl exec "$NEW_POD" -- cat /usr/share/nginx/html/index.html | tr -d '\r\n')
 
-echo -e "Dado original gravado:     ${YELLOW}$TEST_TOKEN${NC}"
-echo -e "Dado recuperado pós-queda:   ${GREEN}$RECOVERED_DATA${NC}"
+echo -e "Identificador gravado originalmente: ${YELLOW}$TEST_TOKEN${NC}"
+echo -e "Identificador recuperado pós-failover: ${GREEN}$RECOVERED_DATA${NC}"
 
 if [[ "$RECOVERED_DATA" == "$TEST_TOKEN" ]]; then
     echo -e "\n${GREEN}========================================================================${NC}"
-    echo -e "${GREEN}[SUCESSO] TESTE DE RESILIÊNCIA CONCLUÍDO COM SUCESSO TOTAL!${NC}"
-    echo -e "${GREEN}O Longhorn manteve os dados íntegros após a queda forçada do nó.${NC}"
+    echo -e "${GREEN}[SUCESSO] TESTE DE RESILIÊNCIA E ALTA DISPONIBILIDADE CONCLUÍDO.${NC}"
+    echo -e "${GREEN}A replicação síncrona do Longhorn garantiu a consistência e integridade dos volumes.${NC}"
     echo -e "${GREEN}========================================================================${NC}"
 else
-    echo -e "${RED}[ERRO] Os dados recuperados diferem do original gravado!${NC}"
+    echo -e "\n${RED}[ERRO] Divergência de integridade detectada entre o dado original e o recuperado.${NC}"
     multipass start "$ACTIVE_WORKER" || true
     exit 1
 fi
 
-# Restaurar o nó desligado
-echo -e "${BLUE}>>> Restaurando o nó '$ACTIVE_WORKER' para normalizar o cluster...${NC}"
+# Restaurar o nó desligado e normalizar o cluster
+echo -e "${BLUE}>>> Reinicializando nó '$ACTIVE_WORKER' para restaurar a topologia original...${NC}"
 multipass start "$ACTIVE_WORKER"
-echo -e "${BLUE}>>> Aguardando nós retornarem ao status 'Ready'...${NC}"
+echo -e "${BLUE}>>> Aguardando transição de todos os nós para a condição 'Ready'...${NC}"
 multipass exec "$MASTER_NAME" -- kubectl wait --for=condition=Ready nodes --all --timeout=180s
 
 END_TIME=$(date +%s)
@@ -457,7 +457,7 @@ MASTER_IP=$(multipass info "$MASTER_NAME" | grep IPv4 | awk '{print $2}')
 
 echo -e "\n${CYAN}${BOLD}"
 echo "========================================================================"
-echo "                PIPELINE EXECUTADO COM SUCESSO TOTAL!                   "
+echo "                   PIPELINE EXECUTADO COM SUCESSO                       "
 echo "========================================================================"
 echo -e "${NC}"
 echo -e "Tempo total: ${BOLD}${MINUTES}m ${SECONDS}s${NC}"
