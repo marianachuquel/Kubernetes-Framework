@@ -393,7 +393,22 @@ echo -e "${YELLOW}>>> Injetando falha: Interrupção não programada do nó '$AC
 echo -e "${YELLOW}========================================================================${NC}"
 multipass stop "$ACTIVE_WORKER"
 
-echo -e "${BLUE}>>> Nó '$ACTIVE_WORKER' desativado. Aguardando reconciliação do plano de controle...${NC}"
+# Confirmar que a VM está realmente parada antes de prosseguir
+echo -e "${BLUE}>>> Confirmando desligamento da instância '$ACTIVE_WORKER'...${NC}"
+for i in {1..20}; do
+    VM_STATE=$(multipass info "$ACTIVE_WORKER" 2>/dev/null | awk '/State:/ {print $2}' || echo "")
+    if [[ "$VM_STATE" == "Stopped" ]]; then
+        echo -e "${GREEN}[OK] Instância '$ACTIVE_WORKER' confirmada como inativa.${NC}"
+        break
+    fi
+    if (( i == 20 )); then
+        echo -e "${RED}[ERRO] Instância '$ACTIVE_WORKER' não parou no tempo esperado. Estado atual: '$VM_STATE'${NC}"
+        exit 1
+    fi
+    sleep 3
+done
+
+echo -e "${BLUE}>>> Aguardando reconciliação do plano de controle...${NC}"
 sleep 15
 
 # Mitigação da proteção de Multi-Attach do Longhorn
@@ -406,8 +421,11 @@ NEW_POD=""
 for i in {1..90}; do
     POD_CANDIDATE=$(multipass exec "$MASTER_NAME" -- kubectl get pod -l app=app-persistente --field-selector status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
     if [[ -n "$POD_CANDIDATE" && "$POD_CANDIDATE" != "$ORIGINAL_POD" ]]; then
-        NEW_POD="$POD_CANDIDATE"
-        break
+        POD_NODE=$(multipass exec "$MASTER_NAME" -- kubectl get pod "$POD_CANDIDATE" -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "")
+        if [[ -n "$POD_NODE" && "$POD_NODE" != "$ACTIVE_WORKER" ]]; then
+            NEW_POD="$POD_CANDIDATE"
+            break
+        fi
     fi
     if (( i % 5 == 0 )); then
         echo -e "Aguardando desanexação/anexação do volume CSI e inicialização do Pod... (${i}/90)"
