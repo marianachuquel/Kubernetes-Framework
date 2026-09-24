@@ -95,6 +95,14 @@ chmod +x deploy-completo.sh
 4. **Instala o Helm e o Longhorn** com 2 réplicas e StorageClass padrão.
 5. **Executa o teste de resiliência**: cria um PVC/Pod NGINX, grava um token persistente, simula falha desligando um nó trabalhador, destrava o volume no nó sobrevivente e valida a preservação integral dos dados.
 
+### Rodar apenas o Teste de Resiliência (em cluster já existente):
+Se você já tem as VMs e o Longhorn configurados e deseja apenas disparar o teste automatizado de failover:
+
+```bash
+./deploy-completo.sh --test-only
+```
+*(ou utilizando o script dedicado [`testar-resiliencia.sh`](testar-resiliencia.sh))*
+
 ### Para destruir e limpar o ambiente:
 ```bash
 ./deploy-completo.sh --cleanup

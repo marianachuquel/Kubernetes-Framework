@@ -64,6 +64,11 @@ if [[ "${1:-}" == "--cleanup" || "${1:-}" == "-c" ]]; then
     exit 0
 fi
 
+TEST_ONLY=false
+if [[ "${1:-}" == "--test-only" || "${1:-}" == "-t" ]]; then
+    TEST_ONLY=true
+fi
+
 START_TIME=$(date +%s)
 
 echo -e "${CYAN}${BOLD}"
@@ -173,116 +178,133 @@ EOF
     echo -e "${GREEN}[OK] Nó '$vm' configurado com sucesso.${NC}"
 }
 
-# ------------------------------------------------------------------------------
-# 5. [Fase 0] Criação e Inicialização das Máquinas Virtuais no Multipass
-# ------------------------------------------------------------------------------
-echo -e "\n${BLUE}=== [1/4] Provisionando Máquinas Virtuais no Multipass ===${NC}"
-for vm in "${VMS[@]}"; do
-    if multipass info "$vm" &> /dev/null; then
-        echo -e "${YELLOW}[AVISO] A VM '$vm' já existe.${NC}"
+if ! $TEST_ONLY; then
+    # ------------------------------------------------------------------------------
+    # 5. [Fase 0] Criação e Inicialização das Máquinas Virtuais no Multipass
+    # ------------------------------------------------------------------------------
+    echo -e "\n${BLUE}=== [1/4] Provisionando Máquinas Virtuais no Multipass ===${NC}"
+    for vm in "${VMS[@]}"; do
+        if multipass info "$vm" &> /dev/null; then
+            echo -e "${YELLOW}[AVISO] A VM '$vm' já existe.${NC}"
+            STATE=$(multipass info "$vm" | awk '/State:/ {print $2}')
+            if [[ "$STATE" != "Running" ]]; then
+                echo -e "${BLUE}>>> VM '$vm' está parada ($STATE). Iniciando...${NC}"
+                multipass start "$vm"
+            else
+                echo -e "${GREEN}[OK] VM '$vm' já está em execução.${NC}"
+            fi
+        else
+            echo -e "${GREEN}>>> Lançando VM '$vm' ($VM_CPUS CPUs, $VM_MEMORY RAM, $VM_DISK Disco)...${NC}"
+            multipass launch "$UBUNTU_RELEASE" \
+                --name "$vm" \
+                --cpus "$VM_CPUS" \
+                --memory "$VM_MEMORY" \
+                --disk "$VM_DISK"
+        fi
+    done
+
+    # Configurar as dependências em cada nó
+    for vm in "${VMS[@]}"; do
+        IS_CONFIGURED=$(multipass exec "$vm" -- bash -c "command -v kubeadm &>/dev/null && echo 'yes' || echo 'no'")
+        if [[ "$IS_CONFIGURED" == "yes" ]]; then
+            echo -e "${GREEN}[OK] Nó '$vm' já possui as ferramentas do Kubernetes instaladas.${NC}"
+        else
+            configure_node "$vm"
+        fi
+    done
+
+    # ------------------------------------------------------------------------------
+    # 6. [Fase 1] Inicialização do Kubernetes e Malha de Rede
+    # ------------------------------------------------------------------------------
+    echo -e "\n${BLUE}=== [2/4] Inicializando Cluster Kubernetes ===${NC}"
+
+    ALREADY_INIT=$(multipass exec "$MASTER_NAME" -- bash -c "test -f /etc/kubernetes/admin.conf && echo 'yes' || echo 'no'")
+    if [[ "$ALREADY_INIT" == "yes" ]]; then
+        echo -e "${YELLOW}[AVISO] Control-Plane já inicializado no nó '$MASTER_NAME'.${NC}"
+    else
+        echo -e "${BLUE}>>> Executando kubeadm init no nó '$MASTER_NAME'...${NC}"
+        multipass exec "$MASTER_NAME" -- sudo kubeadm init \
+            --pod-network-cidr="$POD_NETWORK_CIDR" \
+            --apiserver-advertise-address="$(multipass exec "$MASTER_NAME" -- bash -c "hostname -I | awk '{print \$1}'")"
+
+        # Configura kubeconfig
+        multipass exec "$MASTER_NAME" -- bash -c "mkdir -p \$HOME/.kube && sudo cp -f /etc/kubernetes/admin.conf \$HOME/.kube/config && sudo chown \$(id -u):\$(id -g) \$HOME/.kube/config"
+    fi
+
+    echo -e "${BLUE}>>> Aplicando plugin de rede Flannel...${NC}"
+    multipass exec "$MASTER_NAME" -- kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+    echo -e "${BLUE}>>> Gerando token de join para conectar os workers...${NC}"
+    JOIN_CMD=$(multipass exec "$MASTER_NAME" -- sudo kubeadm token create --print-join-command)
+
+    WORKERS=("$WORKER1_NAME" "$WORKER2_NAME")
+    for worker in "${WORKERS[@]}"; do
+        IS_JOINED=$(multipass exec "$worker" -- bash -c "test -f /etc/kubernetes/kubelet.conf && echo 'yes' || echo 'no'")
+        if [[ "$IS_JOINED" == "yes" ]]; then
+            echo -e "${YELLOW}[AVISO] Nó '$worker' já conectado ao cluster.${NC}"
+        else
+            echo -e "${GREEN}>>> Conectando nó '$worker' ao cluster...${NC}"
+            multipass exec "$worker" -- sudo bash -c "$JOIN_CMD"
+        fi
+    done
+
+    echo -e "${BLUE}>>> Aguardando todos os nós atingirem o status 'Ready'...${NC}"
+    multipass exec "$MASTER_NAME" -- kubectl wait --for=condition=Ready nodes --all --timeout=300s
+    echo -e "${GREEN}[OK] Cluster Kubernetes 100% operacional!${NC}"
+    multipass exec "$MASTER_NAME" -- kubectl get nodes -o wide
+
+    # ------------------------------------------------------------------------------
+    # 7. [Fase 2] Instalação do Longhorn via Helm
+    # ------------------------------------------------------------------------------
+    echo -e "\n${BLUE}=== [3/4] Instalando e Configurando o Longhorn ===${NC}"
+
+    HELM_INSTALLED=$(multipass exec "$MASTER_NAME" -- bash -c "command -v helm &>/dev/null && echo 'yes' || echo 'no'")
+    if [[ "$HELM_INSTALLED" == "no" ]]; then
+        echo -e "${BLUE}>>> Instalando Helm no master...${NC}"
+        multipass exec "$MASTER_NAME" -- bash -c "curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash"
+    fi
+
+    echo -e "${BLUE}>>> Adicionando repositório do Longhorn...${NC}"
+    multipass exec "$MASTER_NAME" -- bash -c "helm repo add longhorn https://charts.longhorn.io && helm repo update"
+
+    LH_INSTALLED=$(multipass exec "$MASTER_NAME" -- bash -c "helm status longhorn -n longhorn-system &>/dev/null && echo 'yes' || echo 'no'")
+    if [[ "$LH_INSTALLED" == "no" ]]; then
+        echo -e "${BLUE}>>> Instalando Longhorn via Helm (Réplicas: $LONGHORN_REPLICAS)...${NC}"
+        multipass exec "$MASTER_NAME" -- bash -c "
+            helm install longhorn longhorn/longhorn \
+              --namespace longhorn-system \
+              --create-namespace \
+              --set defaultSettings.defaultReplicaCount=$LONGHORN_REPLICAS
+        "
+    fi
+
+    echo -e "${BLUE}>>> Aguardando componentes do Longhorn ficarem operacionais (rollout)...${NC}"
+    multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status daemonset/longhorn-manager --timeout=400s
+    multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status deployment/longhorn-driver-deployer --timeout=400s
+    multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status daemonset/longhorn-csi-plugin --timeout=600s
+    multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status deployment/csi-provisioner --timeout=600s
+    multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status deployment/csi-attacher --timeout=600s
+
+    echo -e "${BLUE}>>> Definindo StorageClass 'longhorn' como padrão...${NC}"
+    multipass exec "$MASTER_NAME" -- kubectl patch storageclass longhorn \
+        -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+    echo -e "${GREEN}[OK] Longhorn configurado como StorageClass padrão.${NC}"
+else
+    echo -e "\n${YELLOW}>>> [Modo Apenas Teste Ativado]${NC}"
+    echo -e "${BLUE}>>> Verificando se as VMs existentes estão operacionais...${NC}"
+    for vm in "${VMS[@]}"; do
+        if ! multipass info "$vm" &>/dev/null; then
+            echo -e "${RED}[ERRO] A VM '$vm' não foi encontrada. O cluster precisa existir para rodar este teste.${NC}"
+            exit 1
+        fi
         STATE=$(multipass info "$vm" | awk '/State:/ {print $2}')
         if [[ "$STATE" != "Running" ]]; then
-            echo -e "${BLUE}>>> VM '$vm' está parada ($STATE). Iniciando...${NC}"
+            echo -e "${BLUE}>>> Iniciando VM '$vm'...${NC}"
             multipass start "$vm"
-        else
-            echo -e "${GREEN}[OK] VM '$vm' já está em execução.${NC}"
         fi
-    else
-        echo -e "${GREEN}>>> Lançando VM '$vm' ($VM_CPUS CPUs, $VM_MEMORY RAM, $VM_DISK Disco)...${NC}"
-        multipass launch "$UBUNTU_RELEASE" \
-            --name "$vm" \
-            --cpus "$VM_CPUS" \
-            --memory "$VM_MEMORY" \
-            --disk "$VM_DISK"
-    fi
-done
-
-# Configurar as dependências em cada nó
-for vm in "${VMS[@]}"; do
-    IS_CONFIGURED=$(multipass exec "$vm" -- bash -c "command -v kubeadm &>/dev/null && echo 'yes' || echo 'no'")
-    if [[ "$IS_CONFIGURED" == "yes" ]]; then
-        echo -e "${GREEN}[OK] Nó '$vm' já possui as ferramentas do Kubernetes instaladas.${NC}"
-    else
-        configure_node "$vm"
-    fi
-done
-
-# ------------------------------------------------------------------------------
-# 6. [Fase 1] Inicialização do Kubernetes e Malha de Rede
-# ------------------------------------------------------------------------------
-echo -e "\n${BLUE}=== [2/4] Inicializando Cluster Kubernetes ===${NC}"
-
-ALREADY_INIT=$(multipass exec "$MASTER_NAME" -- bash -c "test -f /etc/kubernetes/admin.conf && echo 'yes' || echo 'no'")
-if [[ "$ALREADY_INIT" == "yes" ]]; then
-    echo -e "${YELLOW}[AVISO] Control-Plane já inicializado no nó '$MASTER_NAME'.${NC}"
-else
-    echo -e "${BLUE}>>> Executando kubeadm init no nó '$MASTER_NAME'...${NC}"
-    multipass exec "$MASTER_NAME" -- sudo kubeadm init \
-        --pod-network-cidr="$POD_NETWORK_CIDR" \
-        --apiserver-advertise-address="$(multipass exec "$MASTER_NAME" -- bash -c "hostname -I | awk '{print \$1}'")"
-
-    # Configura kubeconfig
-    multipass exec "$MASTER_NAME" -- bash -c "mkdir -p \$HOME/.kube && sudo cp -f /etc/kubernetes/admin.conf \$HOME/.kube/config && sudo chown \$(id -u):\$(id -g) \$HOME/.kube/config"
+    done
+    echo -e "${GREEN}[OK] VMs operacionais. Pulando provisionamento e instalação.${NC}"
 fi
-
-echo -e "${BLUE}>>> Aplicando plugin de rede Flannel...${NC}"
-multipass exec "$MASTER_NAME" -- kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
-
-echo -e "${BLUE}>>> Gerando token de join para conectar os workers...${NC}"
-JOIN_CMD=$(multipass exec "$MASTER_NAME" -- sudo kubeadm token create --print-join-command)
-
-WORKERS=("$WORKER1_NAME" "$WORKER2_NAME")
-for worker in "${WORKERS[@]}"; do
-    IS_JOINED=$(multipass exec "$worker" -- bash -c "test -f /etc/kubernetes/kubelet.conf && echo 'yes' || echo 'no'")
-    if [[ "$IS_JOINED" == "yes" ]]; then
-        echo -e "${YELLOW}[AVISO] Nó '$worker' já conectado ao cluster.${NC}"
-    else
-        echo -e "${GREEN}>>> Conectando nó '$worker' ao cluster...${NC}"
-        multipass exec "$worker" -- sudo bash -c "$JOIN_CMD"
-    fi
-done
-
-echo -e "${BLUE}>>> Aguardando todos os nós atingirem o status 'Ready'...${NC}"
-multipass exec "$MASTER_NAME" -- kubectl wait --for=condition=Ready nodes --all --timeout=300s
-echo -e "${GREEN}[OK] Cluster Kubernetes 100% operacional!${NC}"
-multipass exec "$MASTER_NAME" -- kubectl get nodes -o wide
-
-# ------------------------------------------------------------------------------
-# 7. [Fase 2] Instalação do Longhorn via Helm
-# ------------------------------------------------------------------------------
-echo -e "\n${BLUE}=== [3/4] Instalando e Configurando o Longhorn ===${NC}"
-
-HELM_INSTALLED=$(multipass exec "$MASTER_NAME" -- bash -c "command -v helm &>/dev/null && echo 'yes' || echo 'no'")
-if [[ "$HELM_INSTALLED" == "no" ]]; then
-    echo -e "${BLUE}>>> Instalando Helm no master...${NC}"
-    multipass exec "$MASTER_NAME" -- bash -c "curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash"
-fi
-
-echo -e "${BLUE}>>> Adicionando repositório do Longhorn...${NC}"
-multipass exec "$MASTER_NAME" -- bash -c "helm repo add longhorn https://charts.longhorn.io && helm repo update"
-
-LH_INSTALLED=$(multipass exec "$MASTER_NAME" -- bash -c "helm status longhorn -n longhorn-system &>/dev/null && echo 'yes' || echo 'no'")
-if [[ "$LH_INSTALLED" == "no" ]]; then
-    echo -e "${BLUE}>>> Instalando Longhorn via Helm (Réplicas: $LONGHORN_REPLICAS)...${NC}"
-    multipass exec "$MASTER_NAME" -- bash -c "
-        helm install longhorn longhorn/longhorn \
-          --namespace longhorn-system \
-          --create-namespace \
-          --set defaultSettings.defaultReplicaCount=$LONGHORN_REPLICAS
-    "
-fi
-
-echo -e "${BLUE}>>> Aguardando componentes do Longhorn ficarem operacionais (rollout)...${NC}"
-multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status daemonset/longhorn-manager --timeout=400s
-multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status deployment/longhorn-driver-deployer --timeout=400s
-multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status daemonset/longhorn-csi-plugin --timeout=600s
-multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status deployment/csi-provisioner --timeout=600s
-multipass exec "$MASTER_NAME" -- kubectl -n longhorn-system rollout status deployment/csi-attacher --timeout=600s
-
-echo -e "${BLUE}>>> Definindo StorageClass 'longhorn' como padrão...${NC}"
-multipass exec "$MASTER_NAME" -- kubectl patch storageclass longhorn \
-    -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
-echo -e "${GREEN}[OK] Longhorn configurado como StorageClass padrão.${NC}"
 
 # ------------------------------------------------------------------------------
 # 8. [Fase 3] Teste de Persistência e Failover / Resiliência
